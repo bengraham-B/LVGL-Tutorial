@@ -102,6 +102,19 @@ void setup() {
     // Center the label inside the button.
     lv_obj_center(label);
 
+    // ---------------------------------------------------------------------------------
+    // Ben stuff
+    lv_obj_t *text = lv_label_create(lv_screen_active()); // Creating the object on active screen
+    lv_label_set_text(text, "Text"); // Setting the text
+
+    // Setting the Position
+    lv_obj_set_x(text, 10);
+    lv_obj_set_y(text, 35);
+
+    // Align with offsets
+    lv_obj_align(text, LV_ALIGN_TOP_MID, 0, 15);
+
+
     // ========================================================
     // ==   <<< YOUR CODE ENDS HERE >>>                      ==
     // ========================================================
