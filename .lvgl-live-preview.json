@@ -1,0 +1,13 @@
+{
+  "mainFile": "src/ui.cpp",
+  "dependencies": [
+    "src/ui.cpp",
+    "src/ui.h"
+  ],
+  "includePaths": [
+    "src"
+  ],
+  "defines": [
+    "LVGL_LIVE_PREVIEW"
+  ]
+}
