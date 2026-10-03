@@ -75,14 +75,21 @@ void setup() {
     // child of it and will hold our grid of labels.
     lv_obj_t * container = lv_obj_create(lv_screen_active());
 
+    #pragma region remove_styles
+    lv_obj_set_style_pad_all(container, 0, 0);
+    lv_obj_set_style_border_width(container, 0, 0);
+    #pragma endregion remove_styles
+
+
+
     // ---- Grid template definition ----
     // A grid needs two arrays: one for column widths, one for row heights.
     // Each entry is a pixel value, LV_GRID_FR(n) for a fraction, or
     // LV_GRID_CONTENT for auto-size. LV_GRID_TEMPLATE_LAST terminates it.
     #pragma region Grid_Array
     // 3 columns of 70 px each → total width 210 px
-    static const int32_t container_style_grid_column_dsc_array_0[] ={70, 70, 70, LV_GRID_TEMPLATE_LAST};
-    lv_obj_set_style_grid_column_dsc_array(container,container_style_grid_column_dsc_array_0, 0);
+    static const int32_t container_style_grid_column_dsc_array_0[] ={LV_GRID_FR(1), 70, 70, LV_GRID_TEMPLATE_LAST};
+    lv_obj_set_style_grid_column_dsc_array(container, container_style_grid_column_dsc_array_0, 0);
 
     // 2 rows of 44 px each → total height 88 px
     static const int32_t container_style_grid_row_dsc_array_1[] ={44, 44, LV_GRID_TEMPLATE_LAST};
@@ -93,7 +100,7 @@ void setup() {
     lv_obj_set_style_layout(container, LV_LAYOUT_GRID, 0);
 
     // Shrink-wrap the container to fit its grid (no extra padding space).
-    lv_obj_set_size(container, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_size(container,  lv_pct(100), lv_pct(100));
 
     // ---------------------------------------------------------
     // Cell placement pattern
