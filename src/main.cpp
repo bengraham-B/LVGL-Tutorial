@@ -1,12 +1,9 @@
 // ============================================================
 // Libraries
 // ============================================================
-// Arduino core — gives us setup(), loop(), Serial, delay(), etc.
-#include <Arduino.h>
-// LVGL — the graphics library. Provides every lv_* function.
-#include <lvgl.h>
-// TFT_eSPI — low-level driver for the ILI9341 display.
-#include <TFT_eSPI.h>
+#include <Arduino.h>   // Arduino core — setup(), loop(), Serial, delay(), millis()
+#include <lvgl.h>      // LVGL graphics library — provides every lv_* function
+#include <TFT_eSPI.h>  // Low-level SPI driver for the ILI9341 display
 
 // ============================================================
 // Global objects and buffers
@@ -15,27 +12,54 @@
 TFT_eSPI tft;
 
 // LVGL's render buffer. LVGL draws into this small RAM area, then
-// hands it to my_disp_flush() which pushes it to the screen.
+// hands it to my_disp_flush(), which pushes it to the screen.
 // 320 * 10 = 320 pixels wide × 10 rows = one horizontal strip.
-// sizeof(buf) is in bytes and passed to LVGL later.
+// Using a partial buffer (instead of full-screen) saves a lot of RAM.
 static lv_color_t buf[320 * 10];
 
 // ============================================================
-// Display flush callback
+// Display flush callback — the LVGL ↔ TFT bridge
 // ============================================================
 // LVGL calls this whenever it has finished rendering a rectangle.
-// We just forward the pixel data to the TFT.
-//
-// You almost never need to touch this — it's the bridge between
-// LVGL's internal rendering and the physical screen.
+// We take that pixel data and hand it to TFT_eSPI, which pushes it
+// over SPI to the ILI9341 panel. You almost never need to edit this.
 void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
+    // Width and height of the dirty rectangle LVGL just rendered.
     uint32_t w = area->x2 - area->x1 + 1;
     uint32_t h = area->y2 - area->y1 + 1;
-    tft.startWrite();
-    tft.setAddrWindow(area->x1, area->y1, w, h);
-    tft.pushColors((uint16_t *)px_map, w * h, true);
-    tft.endWrite();
-    lv_display_flush_ready(disp);   // tell LVGL we're done with this chunk
+
+    tft.startWrite();                                // grab the SPI bus
+    tft.setAddrWindow(area->x1, area->y1, w, h);     // set the draw window
+    tft.pushColors((uint16_t *)px_map, w * h, true); // blast pixels (swap bytes)
+    tft.endWrite();                                  // release the SPI bus
+
+    // Tell LVGL "this chunk is on screen, send the next one".
+    // Without this call, LVGL stops sending further updates.
+    lv_display_flush_ready(disp);
+}
+
+// ============================================================
+// Globals for the timer-driven label
+// ============================================================
+// NOTE: these are just POINTERS. No LVGL objects are created here.
+// LVGL objects must only be created after lv_init() runs — i.e.
+// inside setup(). Creating them at file scope (static init time)
+// runs before lv_init() and is undefined behaviour.
+lv_obj_t *label_update_timer = nullptr;
+
+// Pointer to the LVGL timer that periodically updates the label.
+static lv_timer_t *update_timer = nullptr;
+
+// Called by LVGL every 1000 ms (see lv_timer_create at the bottom
+// of setup()). Updates the label with an incrementing counter.
+static void update_timer_cb(lv_timer_t *t) {
+    // 'static' so the value persists between calls.
+    static int counter = 0;
+
+    // lv_label_set_text_fmt() formats directly into LVGL's own
+    // buffer — safer than building a std::string temporary and
+    // passing a .c_str() pointer that may dangle.
+    lv_label_set_text_fmt(label_update_timer, "%d", counter++);
 }
 
 // ============================================================
@@ -46,64 +70,71 @@ void setup() {
     // --------------------------------------------------------
     // 1. Serial + hardware init
     // --------------------------------------------------------
-    Serial.begin(115200);
-    delay(500);                 // small delay so Serial is ready
+    Serial.begin(115200);        // USB serial for debug prints
+    delay(500);                  // small delay so Serial is ready
 
-    tft.init();                 // initialize the ILI9341
-    tft.setRotation(3);         // 0=portrait, 1=landscape 320x240, 2/3=flipped
-    tft.fillScreen(TFT_BLACK);  // clear the panel before LVGL takes over
+    tft.init();                  // wake up the ILI9341
+    tft.setRotation(3);          // 320×240 landscape
+    tft.fillScreen(TFT_BLACK);   // clear the panel before LVGL takes over
 
     // --------------------------------------------------------
     // 2. LVGL core + display registration
     // --------------------------------------------------------
-    lv_init();                  // boot LVGL's internal state machine
+    lv_init();                   // boot LVGL's internal state machine
 
-    // Create a virtual display of 320x240 and tell LVGL to draw to it.
+    // *** CRITICAL ***
+    // Tell LVGL to use Arduino's millis() as its time base.
+    // Without this, lv_tick_get() always returns 0, no timer ever
+    // expires, and lv_timer_handler() prints:
+    //     "It seems lv_tick_inc() is not called"
+    // This is the single line that makes timers (and touch input)
+    // actually work on ESP32.
+    lv_tick_set_cb((lv_tick_get_cb_t)millis);
+
+    // Create a virtual display of 320×240 and tell LVGL to draw to it.
     lv_display_t *disp = lv_display_create(320, 240);
 
-    // Give LVGL the function it should call to push pixels out.
+    // Register the function that pushes pixels to the physical screen.
     lv_display_set_flush_cb(disp, my_disp_flush);
 
     // Hand over the render buffer. NULL second buffer = single-buffer mode.
-    // sizeof(buf) is in bytes; LVGL handles the rest.
+    // PARTIAL mode means LVGL renders in chunks (here, 10-px strips)
+    // instead of the whole screen at once — much lighter on RAM.
     lv_display_set_buffers(disp, buf, NULL, sizeof(buf),
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
 
-    // Make this the default display (so lv_screen_active() finds it).
+    // Make this the default display, so lv_screen_active() finds it.
     lv_display_set_default(disp);
 
     // ========================================================
-    // ========================================================
-    // ==                                                    ==
-    // ==   >>> YOUR CODE STARTS HERE <<<                    ==
-    // ==                                                    ==
-    // ==   Everything below this point is your UI.         ==
-    // ==   Add widgets, styles, callbacks, screens, etc.   ==
-    // ==                                                    ==
-    // ========================================================
+    // ==   YOUR UI STARTS HERE                              ==
     // ========================================================
 
-    // ---- Example UI: one button with a label ----
-    // Create a button as a child of the currently active screen.
+    // ---- The label that the timer will update ----
+    // Created AFTER lv_init() and AFTER the display is registered.
+    // Stored in the global pointer so the timer callback can find it.
+    label_update_timer = lv_label_create(lv_screen_active());
+    lv_label_set_text(label_update_timer, "0");
+    lv_obj_align(label_update_timer, LV_ALIGN_TOP_LEFT, 10, 10);
+
+    // ---- Example UI: a button with its own label ----
+    // NOTE: the button's label uses a DIFFERENT name (btn_label).
+    // This prevents any shadowing or confusion with label_update_timer.
     lv_obj_t *btn = lv_button_create(lv_screen_active());
+    lv_obj_set_size(btn, 120, 50);         // width × height in pixels
+    lv_obj_center(btn);                    // centre on its parent (the screen)
 
-    // Set the button's width and height in pixels.
-    lv_obj_set_size(btn, 120, 50);
+    lv_obj_t *btn_label = lv_label_create(btn);  // label as a child of the button
+    lv_label_set_text(btn_label, "Hello");
+    lv_obj_center(btn_label);                    // centre inside the button
 
-    // Center it on the parent (the screen).
-    lv_obj_center(btn);
-
-    // Create a label as a child of the button.
-    lv_obj_t *label = lv_label_create(btn);
-
-    // Set the label's text.
-    lv_label_set_text(label, "Hello");
-
-    // Center the label inside the button.
-    lv_obj_center(label);
+    // ---- Start the periodic update timer ----
+    // Fires every 1000 ms. Because lv_tick_set_cb(millis) is set above,
+    // LVGL now has a working clock and this timer will actually expire.
+    update_timer = lv_timer_create(update_timer_cb, 1000, NULL);
 
     // ========================================================
-    // ==   <<< YOUR CODE ENDS HERE >>>                      ==
+    // ==   YOUR UI ENDS HERE                                ==
     // ========================================================
 }
 
@@ -111,19 +142,12 @@ void setup() {
 // loop() — runs forever after setup()
 // ============================================================
 void loop() {
-    // Let LVGL do its work: process input, run animations,
-    // trigger callbacks, redraw dirty areas.
+    // Let LVGL do its work: process timers, redraw dirty areas,
+    // run animations, fire callbacks.
     // If you remove this, nothing on screen updates.
     lv_timer_handler();
 
-    // Tiny breather — prevents the loop from hogging the CPU.
+    // Tiny breather — keeps the CPU from being pegged at 100%.
+    // 5 ms is short enough that the UI stays responsive.
     delay(5);
-
-    // --------------------------------------------------------
-    // You can also add your own periodic logic here:
-    //   - Read sensors
-    //   - Check WiFi/MQTT state
-    //   - Update a label every N milliseconds
-    // Just keep it non-blocking so lv_timer_handler() keeps running.
-    // --------------------------------------------------------
 }
