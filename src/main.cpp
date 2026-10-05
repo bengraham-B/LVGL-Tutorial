@@ -50,7 +50,7 @@ void setup() {
     delay(500);                 // small delay so Serial is ready
 
     tft.init();                 // initialize the ILI9341
-    tft.setRotation(1);         // 0=portrait, 1=landscape 320x240, 2/3=flipped
+    tft.setRotation(3);         // 0=portrait, 1=landscape 320x240, 2/3=flipped
     tft.fillScreen(TFT_BLACK);  // clear the panel before LVGL takes over
 
     // --------------------------------------------------------
