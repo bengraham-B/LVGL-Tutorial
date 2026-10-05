@@ -4,7 +4,7 @@
 #include <Arduino.h>   // Arduino core: setup(), loop(), Serial, delay()
 #include <lvgl.h>      // LVGL graphics library: every lv_* function
 #include <TFT_eSPI.h>  // Low-level SPI driver for the ILI9341 (CYD display)
-
+#include <XPT2046_Touchscreen.h>
 // ============================================================
 // Global objects and buffers
 // ============================================================
@@ -16,6 +16,33 @@ TFT_eSPI tft;  // The physical display driver instance
 // Using a small partial buffer saves RAM (ESP32 has ~320 KB SRAM,
 // but LVGL with full-screen double-buffering would need ~150 KB).
 static lv_color_t buf[320 * 10];
+
+// CYD touchscreen pins
+#define XPT2046_IRQ 36
+#define XPT2046_MOSI 32
+#define XPT2046_MISO 39
+#define XPT2046_CLK 25
+#define XPT2046_CS 33
+
+SPIClass touchscreenSPI = SPIClass(VSPI);  // VSPI — critical for CYD
+XPT2046_Touchscreen touchscreen(XPT2046_CS);
+// LVGL touch read callback — called by LVGL every frame
+void my_touch_read(lv_indev_t *indev, lv_indev_data_t *data) {
+    if (touchscreen.tirqTouched() && touchscreen.touched()) {
+        TS_Point p = touchscreen.getPoint();
+
+        // These calibration values work for most CYDs.
+        // If touch is inverted/mirrored, swap or adjust these.
+        int16_t x = map(p.x, 200, 3700, 0, 320);
+        int16_t y = map(p.y, 240, 3800, 0, 240);
+
+        data->point.x = x;
+        data->point.y = y;
+        data->state = LV_INDEV_STATE_PRESSED;
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
 
 // ============================================================
 // Display flush callback — the LVGL ↔ TFT bridge
@@ -35,6 +62,24 @@ void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     lv_display_flush_ready(disp);  // tell LVGL "this chunk is on screen, send more"
 }
 
+static lv_obj_t * counter_label;
+static uint32_t  click_count;
+
+
+
+
+static void event_cb(lv_event_t * e)
+{
+    LV_UNUSED(e);
+    click_count++;
+    LV_LOG_USER("Button Clicked (%u)", (unsigned)click_count);
+    lv_label_set_text_fmt(counter_label, "Clicks (%u)", (unsigned)click_count);
+}
+
+// --------------------------------------------------
+
+
+
 // ============================================================
 // setup() — runs once at boot
 // ============================================================
@@ -45,7 +90,7 @@ void setup() {
     delay(500);                 // give the serial port time to come up
 
     tft.init();                 // wake up the ILI9341
-    tft.setRotation(1);         // 1 = landscape 320×240 (CYD default)
+    tft.setRotation(3);         // 1 = landscape 320×240 (CYD default)
     tft.fillScreen(TFT_BLACK);  // clear panel before LVGL owns it
 
     // ---- 2. LVGL core + display registration ----
@@ -65,6 +110,16 @@ void setup() {
 
     // Make this the default display, so lv_screen_active() finds it.
     lv_display_set_default(disp);
+
+    // ---- 3. Touchscreen init + LVGL input device ----
+    touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+    touchscreen.begin(touchscreenSPI);
+    touchscreen.setRotation(1);  // match display rotation
+
+    lv_indev_t *indev = lv_indev_create();
+    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(indev, my_touch_read);
+    lv_indev_set_display(indev, disp);  // link to your display
 
     // ========================================================
     // ==   YOUR UI STARTS HERE                              ==
@@ -92,7 +147,7 @@ void setup() {
     lv_obj_set_style_grid_column_dsc_array(container, container_style_grid_column_dsc_array_0, 0);
 
     // 2 rows of 44 px each → total height 88 px
-    static const int32_t container_style_grid_row_dsc_array_1[] ={44, 44, LV_GRID_TEMPLATE_LAST};
+    static const int32_t container_style_grid_row_dsc_array_1[] ={44, 44, 44, 65, LV_GRID_TEMPLATE_LAST};
     lv_obj_set_style_grid_row_dsc_array(container,container_style_grid_row_dsc_array_1, 0);
     #pragma endregion Grid_Array
 
@@ -166,7 +221,9 @@ void setup() {
     lv_obj_set_style_bg_color(label_5, lv_color_hex(0x27ae60), 0);
     lv_obj_set_style_bg_opa(label_5, (255 * 100 / 100), 0);
     lv_obj_set_style_text_color(label_5, lv_color_hex(0xffffff), 0);
-    lv_label_set_text(label_5, "1,1");
+    lv_label_set_text(label_5, "Padding");
+    lv_obj_set_style_pad_all(label_5, 5, 0);
+
 
     // ---- Row 1, Column 2 — green cell labelled "2,1" ----
     lv_obj_t * label_6 = lv_label_create(container);
@@ -178,6 +235,27 @@ void setup() {
     lv_obj_set_style_bg_opa(label_6, (255 * 100 / 100), 0);
     lv_obj_set_style_text_color(label_6, lv_color_hex(0xffffff), 0);
     lv_label_set_text(label_6, "2,1");
+
+    // ---- Row 3, Column 0 — button ----
+    lv_obj_t * button = lv_button_create(container); // attach button to the grid
+    lv_obj_t * btn_label = lv_label_create(button); // attach label to the button
+    lv_label_set_text(btn_label, "Button");
+    lv_obj_set_style_grid_cell_column_pos(button, 0, 0);
+    lv_obj_set_style_grid_cell_row_pos(button, 3, 0);
+    lv_obj_add_event_cb(button, event_cb, LV_EVENT_CLICKED, NULL);
+
+    // ---- Row 3, Column 1 - Counter ----
+    counter_label = lv_label_create(container); // Attaching the label to the grid
+    lv_obj_set_style_grid_cell_column_pos(counter_label, 1, 0);
+    lv_obj_set_style_grid_cell_row_pos(counter_label, 3, 0);
+    lv_label_set_text(counter_label, "Clicks: 0");
+
+    // ---- Row 4, Column 1 - Something ----
+    std::string value = "GOOSE_CPT";
+    lv_obj_t * value_label = lv_label_create(container); // Creating Label object and attaching it to the grid
+    lv_label_set_text(value_label, value.c_str()); // setting the text of the label
+    lv_obj_set_style_grid_cell_column_pos(value_label, 2, 0); // setting column position of the value
+    lv_obj_set_style_grid_cell_row_pos(value_label, 3, 0);
 
     // ========================================================
     // ==   YOUR UI ENDS HERE                                ==

@@ -1,0 +1,756 @@
+
+None selected 
+
+Skip to content
+Using Gmail with screen readers
+Conversations
+ESP32
+Inbox
+Albert Graham <albertg@reutechsystems.com>
+	
+AttachmentsSun, Oct 4, 1:11 PM (1 day ago)
+	
+	
+to me
+
+ 
+
+ 
+
+Regards,
+
+Albert Graham
+
+Snr System Engineer
+
+/*
+  LCDWIKI 2.8" ESP32-32E Display (E32R28T / E32N28T), ILI9341 240x320,
+  resistive touch (XPT2046) - UART NMEA GPS monitor. Listens for GGA/RMC
+  sentences at 115200 baud and displays the same single-fix info table used
+  throughout this project's earlier dashboards: Time, Date, Fix, Satellites,
+  HDOP, Latitude, Longitude, Ellipsoidal Height, Speed, Course, Distance to
+  a fixed reference point.
+
+  *** THIS IS A DIFFERENT BOARD FROM THE "CYD" ESP32-2432S028R ***
+  Despite superficial similarity (2.8" ILI9341, resistive touch), this is a
+  distinct product (LCDWIKI/Elecrow ESP32-32E module) with its own PCB
+  design and pin assignments - do not reuse pin definitions from other
+  "yellow display" boards.
+
+  All pins below are CONFIRMED directly from LCDWIKI's own official demo
+  instructions (cross-checked across three independent documents - Arduino,
+  MicroPython, and ESP-IDF demo PDFs, all identical):
+    TFT_CS=IO15, TFT_RS/DC=IO2, TFT_SCK=IO14, TFT_MOSI=IO13, TFT_MISO=IO12,
+    TFT_RST=EN (shared with the board's own reset - no separate GPIO),
+    TFT_BL=IO21
+    Touch (XPT2046, separate SPI bus from the display - documented here
+    for reference, but NOT defined in code below, since defining only
+    part of a second SPI bus can cause TFT_eSPI to hang during init - see
+    comment at the pin definitions):
+    TP_CS=IO33, TP_SCK=IO25, TP_DIN=IO32, TP_DOUT=IO39, TP_IRQ=IO36
+
+  *** IMPORTANT: the exposed "UART" JST connector on this board is SHARED
+  with the onboard USB-to-serial chip (CH340C) used for programming - it is
+  NOT a free port and must NOT be used for the external GPS, or you'll
+  conflict with uploads/Serial Monitor. ***
+
+  The genuinely free pin, per LCDWIKI's own manual, is the one broken out
+  separately as "Expand Pin": IO35. This pin is INPUT-ONLY (a hardware
+  restriction on this GPIO, not a board design choice) - but since this
+  sketch only needs to RECEIVE NMEA data (monitoring, not sending anything
+  back to the GPS), that's not a limitation here: RX-only on IO35, TX
+  deliberately left disabled (-1).
+
+  Libraries needed (Arduino Library Manager):
+    - TFT_eSPI (by Bodmer)
+
+  *** REQUIRED SETUP STEP - READ BEFORE UPLOADING ***
+  This board's display configuration must be installed as the TFT_eSPI
+  library's actual User_Setup.h file, NOT embedded in this sketch.
+  (Earlier attempts using #define USER_SETUP_LOADED + pin macros directly
+  in the sketch caused tft.init() to hang indefinitely regardless of which
+  pin values were used - confirmed via repeated testing. TFT_eSPI's own
+  documentation states sketch-level defines are not the supported
+  configuration path.)
+
+  Steps:
+    1. Locate your TFT_eSPI library folder, typically:
+       Windows: Documents\Arduino\libraries\TFT_eSPI
+       macOS:   ~/Documents/Arduino/libraries/TFT_eSPI
+    2. Rename the existing User_Setup.h in that folder to User_Setup_bak.h
+    3. Copy the User_Setup.h provided alongside this sketch (sourced
+       verbatim from the board manufacturer's own repository,
+       https://github.com/microrobotics/E32R28T/blob/main/User_Setup.h)
+       into that same TFT_eSPI library folder.
+    4. Restart the Arduino IDE, then compile and upload this sketch.
+*/
+
+#include <TFT_eSPI.h>
+#include <string.h>
+#include <stdlib.h>
+
+TFT_eSPI tft = TFT_eSPI();
+
+// Off-screen sprite for the data table (everything below the header). All
+// row content is drawn into this buffer, then pushed to the real screen in
+// one single fast operation - the user only ever sees a complete, finished
+// frame, never an in-progress clear-then-redraw sequence. This is what
+// actually eliminates flicker, rather than just minimizing the size of
+// each cleared zone.
+TFT_eSprite tableSprite = TFT_eSprite(&tft);
+
+// Same technique applied to the header, which redraws every 250ms in
+// loop() and had the exact same direct-to-screen flicker the table did.
+TFT_eSprite headerSprite = TFT_eSprite(&tft);
+
+// ================= NMEA UART =================
+// IO35 confirmed free (the board's own "Expand Pin"), input-only - fine
+// for receive-only NMEA monitoring. TX intentionally disabled (-1): we
+// have nothing to send to the GPS, and there is no free TX-capable pin
+// exposed on this board anyway (the labeled "UART" connector is the
+// programming port, not available for this purpose).
+#define GPS_RX_PIN 35
+#define GPS_BAUD   115200
+HardwareSerial GpsSerial(2); // ESP32 UART2
+
+// ================= Reference point (Distance row) =================
+#define REF_LAT -34.526000827    //    -34.567149
+#define REF_LON  20.261826644    //     20.368563
+
+// ================= GPS data model (single fix) =================
+struct GpsData {
+  char   utcTime[9]  = "--:--:--";
+  char   date[11]    = "--/--/----";
+  bool   hasFix        = false;
+  int    fixQuality    = 0;
+  int    numSatellites = 0;
+  float  hdop           = 0;
+  double latitude        = 0;
+  double longitude       = 0;
+  float  altitudeM       = 0;
+  float  geoidSepM       = 0;
+  float  ellipsoidalHeightM = 0;
+  float  speedKnots      = 0;
+  float  courseDeg       = 0;
+  bool   rmcValid        = false;
+  bool   hasPosition     = false;
+  bool   hasAltitude     = false;
+} gps;
+
+unsigned long lastSentenceMillis = 0;
+
+// ================= NMEA parsing (char*-based, no heap allocation) =================
+int splitFields(char *sentence, char *fields[], int maxFields) {
+  int idx = 0;
+  fields[idx++] = sentence;
+  char *p = sentence;
+  while (*p && idx < maxFields) {
+    if (*p == ',') {
+      *p = '\0';
+      fields[idx++] = p + 1;
+    }
+    p++;
+  }
+  char *star = strchr(fields[idx - 1], '*');
+  if (star) *star = '\0';
+  return idx;
+}
+
+double nmeaToDecimalDegrees(const char *raw, char dir, int degreeDigits) {
+  int len = strlen(raw);
+  if (len < degreeDigits) return 0;
+  char degBuf[4] = {0};
+  strncpy(degBuf, raw, degreeDigits);
+  double degrees = atof(degBuf);
+  double minutes = atof(raw + degreeDigits);
+  double dd = degrees + minutes / 60.0;
+  if (dir == 'S' || dir == 'W') dd = -dd;
+  return dd;
+}
+
+#define TIMEZONE_OFFSET_HOURS 2 // GMT+2 - change if needed
+
+void formatTime(const char *raw, char *out, size_t outSize) {
+  if (strlen(raw) < 6) { strncpy(out, "--:--:--", outSize); return; }
+  int hh = (raw[0]-'0')*10 + (raw[1]-'0');
+  int mm = (raw[2]-'0')*10 + (raw[3]-'0');
+  int ss = (raw[4]-'0')*10 + (raw[5]-'0');
+  hh = (hh + TIMEZONE_OFFSET_HOURS) % 24;
+  if (hh < 0) hh += 24;
+  snprintf(out, outSize, "%02d:%02d:%02d", hh, mm, ss);
+}
+
+void formatDate(const char *raw, char *out, size_t outSize) {
+  if (strlen(raw) < 6) { strncpy(out, "--/--/----", outSize); return; }
+  snprintf(out, outSize, "%c%c/%c%c/20%c%c", raw[0],raw[1],raw[2],raw[3],raw[4],raw[5]);
+}
+
+void parseGGA(GpsData &g, char *fields[], int count) {
+  if (count < 10) return;
+  formatTime(fields[1], g.utcTime, sizeof(g.utcTime));
+  if (strlen(fields[2]) > 0 && strlen(fields[4]) > 0) {
+    g.latitude    = nmeaToDecimalDegrees(fields[2], fields[3][0], 2);
+    g.longitude   = nmeaToDecimalDegrees(fields[4], fields[5][0], 3);
+    g.hasPosition = true;
+  } else {
+    g.latitude = 0; g.longitude = 0; g.hasPosition = false;
+  }
+  g.fixQuality    = atoi(fields[6]);
+  g.hasFix        = g.fixQuality > 0;
+  g.numSatellites = atoi(fields[7]);
+  g.hdop          = atof(fields[8]);
+
+  if (strlen(fields[9]) > 0) {
+    g.altitudeM = atof(fields[9]);
+    if (count > 11 && strlen(fields[11]) > 0) g.geoidSepM = atof(fields[11]);
+    g.ellipsoidalHeightM = g.altitudeM + g.geoidSepM;
+    g.hasAltitude = true;
+  }
+}
+
+void parseRMC(GpsData &g, char *fields[], int count) {
+  if (count < 10) return;
+  formatTime(fields[1], g.utcTime, sizeof(g.utcTime));
+  g.rmcValid = (strcmp(fields[2], "A") == 0);
+  if (strlen(fields[3]) > 0 && strlen(fields[5]) > 0) {
+    g.latitude    = nmeaToDecimalDegrees(fields[3], fields[4][0], 2);
+    g.longitude   = nmeaToDecimalDegrees(fields[5], fields[6][0], 3);
+    g.hasPosition = true;
+  } else {
+    g.latitude = 0; g.longitude = 0; g.hasPosition = false;
+  }
+  g.speedKnots = atof(fields[7]);
+  g.courseDeg  = atof(fields[8]);
+  formatDate(fields[9], g.date, sizeof(g.date));
+}
+
+double haversineMeters(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000.0;
+  double dLat = radians(lat2 - lat1);
+  double dLon = radians(lon2 - lon1);
+  double a = sin(dLat/2)*sin(dLat/2) + cos(radians(lat1))*cos(radians(lat2))*sin(dLon/2)*sin(dLon/2);
+  return R * 2 * atan2(sqrt(a), sqrt(1-a));
+}
+
+// Initial bearing (forward azimuth) from point1 to point2, standard
+// great-circle formula, normalized to 0-360 degrees. Verified against the
+// four cardinal directions (N/E/S/W) before use.
+double bearingDegrees(double lat1, double lon1, double lat2, double lon2) {
+  double phi1 = radians(lat1), phi2 = radians(lat2);
+  double dLon = radians(lon2 - lon1);
+  double y = sin(dLon) * cos(phi2);
+  double x = cos(phi1)*sin(phi2) - sin(phi1)*cos(phi2)*cos(dLon);
+  double theta = atan2(y, x);
+  return fmod(degrees(theta) + 360.0, 360.0);
+}
+
+const char *fixQualityText(int q) {
+  switch (q) {
+    case 0: return "No Fix";
+    case 1: return "GPS";
+    case 2: return "DGPS";
+    case 3: return "PPS";
+    case 4: return "RTK Fixed";
+    case 5: return "RTK Float";
+    case 6: return "Estimated";
+    default: return "Unknown";
+  }
+}
+
+bool isRTK() { return gps.fixQuality == 4 || gps.fixQuality == 5; }
+
+#define NMEA_TIMEOUT_MS 5000UL
+bool hasRecentNmea() {
+  return lastSentenceMillis != 0 && (millis() - lastSentenceMillis) < NMEA_TIMEOUT_MS;
+}
+
+// ================= UART line reassembly buffer =================
+#define LINE_BUF_SIZE 220
+char lineBuf[LINE_BUF_SIZE];
+size_t lineLen = 0;
+bool gpsDataUpdated = false;
+
+void processCompleteLine(char *line) {
+  size_t len = strlen(line);
+  while (len > 0 && (line[len-1] == '\r' || line[len-1] == '\n' || line[len-1] == ' ')) {
+    line[--len] = '\0';
+  }
+  while (*line == ' ') line++;
+
+  if (line[0] != '$' || strlen(line) <= 6) return;
+
+  int firstComma = -1;
+  for (int i = 0; line[i]; i++) { if (line[i] == ',') { firstComma = i; break; } }
+  if (firstComma < 0 || firstComma > 8) return;
+
+  char tag[9];
+  strncpy(tag, line, firstComma);
+  tag[firstComma] = '\0';
+
+  const char *sentenceType = nullptr;
+  if (strstr(tag, "RMC")) sentenceType = "RMC";
+  else if (strstr(tag, "GGA")) sentenceType = "GGA";
+  if (!sentenceType) return;
+
+  // Copy the raw line BEFORE splitFields() runs - splitFields() modifies
+  // its input in place (replacing commas with null terminators), so
+  // logging the original 'line' pointer afterward would only capture the
+  // first field. Same fix as was needed earlier in this project's SD
+  // logging for the same underlying reason.
+  char rawLineCopy[LINE_BUF_SIZE];
+  strncpy(rawLineCopy, line, sizeof(rawLineCopy) - 1);
+  rawLineCopy[sizeof(rawLineCopy) - 1] = '\0';
+
+  char *fields[20];
+  int count = splitFields(line, fields, 20);
+
+  if (strcmp(sentenceType, "GGA") == 0) {
+    parseGGA(gps, fields, count);
+  } else {
+    parseRMC(gps, fields, count);
+  }
+  lastSentenceMillis = millis();
+  gpsDataUpdated = true;
+
+  if (gps.hasFix || gps.rmcValid) {
+    logValidNmeaLine(rawLineCopy);
+  }
+}
+
+void feedGpsData() {
+  while (GpsSerial.available()) {
+    char c = (char)GpsSerial.read();
+    if (c == '\n') {
+      lineBuf[lineLen] = '\0';
+      processCompleteLine(lineBuf);
+      lineLen = 0;
+    } else {
+      if (lineLen < LINE_BUF_SIZE - 1) {
+        lineBuf[lineLen++] = c;
+      } else {
+        lineLen = 0; // line too long / no terminator - reset rather than overflow
+      }
+    }
+  }
+}
+
+// ================= SD card logging =================
+// Pins CONFIRMED directly from LCDWIKI's own ESP-IDF demo instructions
+// (same authoritative source as the display/touch/LED/battery pins above):
+//   SD_CS=IO5, SD_SCK=IO18, SD_MISO=IO19, SD_MOSI=IO23
+// These happen to match the ESP32's default VSPI pins, so the standard SD
+// library works with just SD.begin(SD_CS) - no custom SPI bus needed.
+// None of these overlap with any other pin used on this board.
+#include <SD.h>
+#define SD_CS 5
+
+#define LOG_TIMEOUT_MS 15000UL // close the file after this long with no valid data
+
+File logFile;
+bool logFileOpen = false;
+unsigned long lastValidDataMillis = 0;
+int logSessionNum = 0;
+bool sdAvailable = false;
+
+// Finds the next unused "/gps_log_NNN.txt" filename. This is now only a
+// FALLBACK naming scheme, used when a log file has to be opened before any
+// valid GPS date/time has been received yet (see buildTimestampedLogName()
+// below, which is tried first). Kept so logging can still start even if
+// the very first sentences received don't include a valid RMC fix.
+void findNextLogSessionNum() {
+  int n = 1;
+  char path[32];
+  while (true) {
+    snprintf(path, sizeof(path), "/gps_log_%03d.txt", n);
+    if (!SD.exists(path)) break;
+    n++;
+  }
+  logSessionNum = n;
+}
+
+const char *monthAbbrev(int m) {
+  static const char *months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+  if (m < 1 || m > 12) return "Unk";
+  return months[m - 1];
+}
+
+// Builds a filename like "/17 Aug 26  08h34.txt" from the GPS's OWN
+// date/time - this board has no RTC of its own, so there is no other
+// clock to draw a timestamp from. gps.date is "DD/MM/YYYY" (set by
+// formatDate()) and gps.utcTime is "HH:MM:SS" already shifted to
+// GMT+2 (set by formatTime()). Colons are deliberately not used in the
+// filename (invalid in FAT filenames) - "h" stands in for it instead,
+// matching the requested format.
+//
+// Returns false (and leaves 'out' untouched) if no valid RMC date has
+// been received yet, so the caller can fall back to a plain name.
+bool buildTimestampedLogName(char *out, size_t outSize) {
+  if (strlen(gps.date) < 10 || strlen(gps.utcTime) < 8) return false;
+  if (gps.date[0] == '-' || gps.utcTime[0] == '-') return false; // still the "--" placeholder
+
+  int day    = (gps.date[0]-'0')*10 + (gps.date[1]-'0');
+  int month  = (gps.date[3]-'0')*10 + (gps.date[4]-'0');
+  int year2  = (gps.date[8]-'0')*10 + (gps.date[9]-'0'); // last 2 digits of the 4-digit year
+  int hh     = (gps.utcTime[0]-'0')*10 + (gps.utcTime[1]-'0');
+  int mm     = (gps.utcTime[3]-'0')*10 + (gps.utcTime[4]-'0');
+
+  snprintf(out, outSize, "/%02d %s %02d  %02dh%02d.txt", day, monthAbbrev(month), year2, hh, mm);
+  return true;
+}
+
+void openNewLogFile() {
+  if (!sdAvailable) return;
+  char path[48];
+
+  if (buildTimestampedLogName(path, sizeof(path))) {
+    // Guard against clobbering a file from the same minute (e.g. the
+    // board rebooted twice within 60s) by appending " (2)", " (3)", etc.
+    if (SD.exists(path)) {
+      char base[48];
+      strncpy(base, path, sizeof(base) - 1);
+      base[sizeof(base) - 1] = '\0';
+      size_t baseLen = strlen(base);
+      if (baseLen > 4) base[baseLen - 4] = '\0'; // strip trailing ".txt"
+      int suffix = 2;
+      do {
+        snprintf(path, sizeof(path), "%s (%d).txt", base, suffix++);
+      } while (SD.exists(path) && suffix < 100);
+    }
+  } else {
+    // No GPS date/time yet (logging can start before the first valid RMC
+    // sentence arrives) - fall back to the old sequential name so logging
+    // still begins; once a timestamp becomes available it will be used
+    // for the *next* file (this one won't be renamed mid-write).
+    snprintf(path, sizeof(path), "/gps_log_%03d.txt", logSessionNum);
+  }
+
+  logFile = SD.open(path, FILE_WRITE);
+  if (logFile) {
+    logFileOpen = true;
+    Serial.printf("SD log opened: %s\n", path);
+  } else {
+    Serial.printf("SD log FAILED to open: %s\n", path);
+    logFileOpen = false;
+  }
+}
+
+void closeLogFile() {
+  if (logFileOpen) {
+    logFile.close();
+    logFileOpen = false;
+    logSessionNum++; // only matters for the fallback naming scheme
+    Serial.println("SD log closed (15s with no valid data).");
+  }
+}
+
+// Called only for sentences that produced a valid fix (see call site) -
+// "valid data" per the request, not every received sentence regardless of
+// fix status.
+void logValidNmeaLine(const char *rawLine) {
+  if (!sdAvailable) return;
+
+  if (!logFileOpen) {
+    openNewLogFile();
+  }
+  if (logFileOpen) {
+    logFile.println(rawLine);
+    logFile.flush(); // ensure data survives an unexpected power loss
+  }
+  lastValidDataMillis = millis();
+}
+
+void checkLogTimeout() {
+  if (logFileOpen && (millis() - lastValidDataMillis > LOG_TIMEOUT_MS)) {
+    closeLogFile();
+  }
+}
+
+// ================= Display: header + single-fix table =================
+// Screen dimensions are read at runtime from the tft object (after init()
+// and setRotation()) rather than hardcoded - makes the layout correct
+// regardless of which rotation value this specific board needs. If the
+// display comes up sideways, just change the rotation number in setup()
+// - nothing else needs to change.
+int screenW, screenH;
+
+#define TABLE_TOP_Y 34
+#define LABEL_X     6
+#define VALUE_X     6
+#define NUM_ROWS    6
+
+// Computed at runtime in setup(), from the screen's ACTUAL height - not
+// hardcoded. Fixed row heights broke once already (6 rows at a hardcoded
+// 40px exceeded this screen's real height, pushing the bottom row off
+// visibly), so row height now always exactly fits whatever height is
+// actually available, regardless of rotation or panel size.
+int ROW_H, LABEL_ZONE_Y, LABEL_ZONE_H, VALUE_ZONE_Y, VALUE_ZONE_H;
+
+void computeRowLayout() {
+  ROW_H = (screenH - TABLE_TOP_Y) / NUM_ROWS;
+  // Same proportions as before (margin | label | value | margin), just
+  // scaled to whatever ROW_H actually comes out to.
+  int margin = ROW_H / 10;
+  if (margin < 2) margin = 2;
+  LABEL_ZONE_Y = margin;
+  LABEL_ZONE_H = ROW_H / 3;
+  if (LABEL_ZONE_H < 10) LABEL_ZONE_H = 10; // font1 needs ~10px minimum
+  VALUE_ZONE_Y = LABEL_ZONE_Y + LABEL_ZONE_H;
+  VALUE_ZONE_H = ROW_H - VALUE_ZONE_Y - margin;
+  if (VALUE_ZONE_H < 18) VALUE_ZONE_H = 18; // font2 needs ~18px minimum
+}
+
+void drawHeader() {
+  uint16_t bgColor;
+  const char *statusText;
+
+  if (lastSentenceMillis == 0) {
+    bool flashOn = (millis()/1000) % 2 == 0;
+    bgColor = flashOn ? TFT_ORANGE : TFT_BLACK;
+    statusText = "NO DATA";
+  } else if (!hasRecentNmea()) {
+    bgColor = TFT_ORANGE;
+    statusText = "NMEA STALE";
+  } else if (!(gps.hasFix || gps.rmcValid) || !gps.hasPosition) {
+    bgColor = TFT_PURPLE;
+    statusText = "NO FIX";
+  } else if (isRTK()) {
+    bgColor = TFT_GREEN;
+    statusText = "RTK";
+  } else {
+    bgColor = TFT_BLUE;
+    statusText = "GNSS";
+  }
+
+  headerSprite.fillSprite(bgColor);
+  headerSprite.setTextColor(TFT_WHITE, bgColor);
+  headerSprite.setTextFont(2);
+  headerSprite.setCursor(6, 9);
+  headerSprite.print("GPS Monitor");
+
+  int w = headerSprite.textWidth(statusText);
+  headerSprite.setCursor(screenW - w - 6, 9);
+  headerSprite.print(statusText);
+
+  headerSprite.pushSprite(0, 0);
+}
+
+// Explicit clear-then-print, per zone: guarantees no leftover/overlapping
+// pixels regardless of font metrics or padding behavior. Now draws into
+// tableSprite (the off-screen buffer) rather than the live screen - any
+// flicker from this clear-then-draw sequence happens invisibly in memory,
+// since the user only ever sees the final result after pushSprite().
+//
+// Vertical layout within each row: margin | label zone | value zone |
+// margin - actual sizes computed at runtime by computeRowLayout(), see above.
+
+void clearAndPrint(int x, int zoneY, int w, int zoneH, uint8_t font, uint16_t color, const char *text) {
+  tableSprite.fillRect(x, zoneY, w, zoneH, TFT_BLACK);
+  tableSprite.setTextFont(font);
+  tableSprite.setTextColor(color, TFT_BLACK);
+  tableSprite.setCursor(x, zoneY + 2); // small, consistent internal offset, centers each glyph within its zone
+  tableSprite.print(text);
+}
+
+void drawRow(int rowIndex, const char *label, const char *value, uint16_t valueColor = TFT_WHITE) {
+  int y = rowIndex * ROW_H; // sprite-relative, no TABLE_TOP_Y offset
+  clearAndPrint(LABEL_X, y + LABEL_ZONE_Y, screenW - LABEL_X, LABEL_ZONE_H, 1, TFT_CYAN, label);
+  clearAndPrint(VALUE_X, y + VALUE_ZONE_Y, screenW - VALUE_X, VALUE_ZONE_H, 2, valueColor, value);
+}
+
+// Time on the left, date starting at the midpoint - moved in from the far
+// right edge (was flush-right) so there's still a clear gap without
+// pinning date all the way to the edge.
+void drawTimeDateRow(int rowIndex, const char *timeStr, const char *dateStr) {
+  int y = rowIndex * ROW_H;
+  int halfW = (screenW - VALUE_X) / 2;
+  int dateX = VALUE_X + halfW; // start of the second half, not flush-right
+
+  clearAndPrint(LABEL_X, y + LABEL_ZONE_Y, screenW - LABEL_X, LABEL_ZONE_H, 1, TFT_CYAN, "Time (GMT+2)               Date");
+  clearAndPrint(VALUE_X, y + VALUE_ZONE_Y, halfW, VALUE_ZONE_H, 2, TFT_WHITE, timeStr);
+  clearAndPrint(dateX,   y + VALUE_ZONE_Y, screenW - dateX, VALUE_ZONE_H, 2, TFT_WHITE, dateStr);
+}
+
+// Fix / HDOP / Satellites, evenly split across three columns.
+void drawFixHdopSatRow(int rowIndex, const char *fixText, uint16_t fixColor, const char *hdopText, const char *satText) {
+  int y = rowIndex * ROW_H;
+  int colW = screenW / 3;
+  int ly = y + LABEL_ZONE_Y, vy = y + VALUE_ZONE_Y;
+
+  clearAndPrint(LABEL_X,            ly, colW, LABEL_ZONE_H, 1, TFT_CYAN, "Fix");
+  clearAndPrint(colW + LABEL_X,     ly, colW, LABEL_ZONE_H, 1, TFT_CYAN, "HDOP");
+  clearAndPrint(2*colW + LABEL_X,   ly, colW, LABEL_ZONE_H, 1, TFT_CYAN, "Satellites");
+
+  clearAndPrint(VALUE_X,            vy, colW - LABEL_X, VALUE_ZONE_H, 2, fixColor,   fixText);
+  clearAndPrint(colW + VALUE_X,     vy, colW - LABEL_X, VALUE_ZONE_H, 2, TFT_WHITE,  hdopText);
+  clearAndPrint(2*colW + VALUE_X,   vy, colW - LABEL_X, VALUE_ZONE_H, 2, TFT_WHITE,  satText);
+}
+
+// Latitude / Longitude, evenly split across two columns.
+void drawLatLonRow(int rowIndex, const char *latText, const char *lonText) {
+  int y = rowIndex * ROW_H;
+  int colW = screenW / 2;
+  int ly = y + LABEL_ZONE_Y, vy = y + VALUE_ZONE_Y;
+
+  clearAndPrint(LABEL_X,          ly, colW, LABEL_ZONE_H, 1, TFT_CYAN, "Latitude");
+  clearAndPrint(colW + LABEL_X,   ly, colW, LABEL_ZONE_H, 1, TFT_CYAN, "Longitude");
+
+  clearAndPrint(VALUE_X,          vy, colW - LABEL_X, VALUE_ZONE_H, 2, TFT_WHITE, latText);
+  clearAndPrint(colW + VALUE_X,   vy, colW - LABEL_X, VALUE_ZONE_H, 2, TFT_WHITE, lonText);
+}
+
+// Distance / Bearing, evenly split across two columns - both measured
+// from the fixed reference point to the current GPS position.
+void drawDistanceBearingRow(int rowIndex, const char *distText, const char *brgText) {
+  int y = rowIndex * ROW_H;
+  int colW = screenW / 2;
+  int ly = y + LABEL_ZONE_Y, vy = y + VALUE_ZONE_Y;
+
+  clearAndPrint(LABEL_X,          ly, colW, LABEL_ZONE_H, 1, TFT_CYAN, "Distance");
+  clearAndPrint(colW + LABEL_X,   ly, colW, LABEL_ZONE_H, 1, TFT_CYAN, "Bearing");
+
+  clearAndPrint(VALUE_X,          vy, colW - LABEL_X, VALUE_ZONE_H, 2, TFT_WHITE, distText);
+  clearAndPrint(colW + VALUE_X,   vy, colW - LABEL_X, VALUE_ZONE_H, 2, TFT_WHITE, brgText);
+}
+
+// Ellipsoidal Height / Speed, evenly split across two columns, height first.
+void drawHeightSpeedRow(int rowIndex, const char *heightText, const char *speedText) {
+  int y = rowIndex * ROW_H;
+  int colW = screenW / 2;
+  int ly = y + LABEL_ZONE_Y, vy = y + VALUE_ZONE_Y;
+
+  clearAndPrint(LABEL_X,          ly, colW, LABEL_ZONE_H, 1, TFT_CYAN, "Above Sea Level");
+  clearAndPrint(colW + LABEL_X,   ly, colW, LABEL_ZONE_H, 1, TFT_CYAN, "Speed");
+
+  clearAndPrint(VALUE_X,          vy, colW - LABEL_X, VALUE_ZONE_H, 2, TFT_WHITE, heightText);
+  clearAndPrint(colW + VALUE_X,   vy, colW - LABEL_X, VALUE_ZONE_H, 2, TFT_WHITE, speedText);
+}
+
+// Drawn once into the sprite right after creation (see setup()) - these
+// pixels sit at the very bottom of each row (y+ROW_H-1), which none of the
+// label/value zone clears above ever touch, so they persist correctly
+// across every subsequent drawTable() call without needing to be redrawn.
+void drawGridLines() {
+  for (int i = 0; i < NUM_ROWS; i++) {
+    int y = i * ROW_H;
+    tableSprite.drawFastHLine(0, y + ROW_H - 1, screenW, 0x18C3);
+  }
+}
+
+void drawTable() {
+  uint16_t fixColor = isRTK() ? TFT_GREEN : TFT_WHITE;
+
+  char fixText[24];
+  snprintf(fixText, sizeof(fixText), "%s", fixQualityText(gps.fixQuality));
+
+  char hdopText[16], satText[8], latText[24], lonText[24], ellipText[24], speedText[24], crsText[16], distText[24], brgText[16];
+  snprintf(hdopText, sizeof(hdopText), "%.1f", gps.hdop);
+  snprintf(satText, sizeof(satText), "%d", gps.numSatellites);
+  snprintf(latText, sizeof(latText), "%.7f %s", gps.latitude, gps.latitude >= 0 ? "N" : "S");
+  snprintf(lonText, sizeof(lonText), "%.7f %s", gps.longitude, gps.longitude >= 0 ? "E" : "W");
+  snprintf(ellipText, sizeof(ellipText), "%.3f m", gps.altitudeM);
+  snprintf(speedText, sizeof(speedText), "%.2f m/s", gps.speedKnots * 0.514444);
+  snprintf(crsText, sizeof(crsText), "%.1f deg", gps.courseDeg);
+
+  if (gps.hasPosition) {
+    snprintf(distText, sizeof(distText), "%.3f m", haversineMeters(REF_LAT, REF_LON, gps.latitude, gps.longitude));
+    snprintf(brgText, sizeof(brgText), "%.1f deg", bearingDegrees(REF_LAT, REF_LON, gps.latitude, gps.longitude));
+  } else {
+    snprintf(distText, sizeof(distText), "-- (no fix)");
+    snprintf(brgText, sizeof(brgText), "--");
+  }
+
+  drawTimeDateRow(0, gps.utcTime, gps.date);
+  drawFixHdopSatRow(1, fixText, fixColor, hdopText, satText);
+  drawLatLonRow(2, latText, lonText);
+  drawRow(3, "Course:", crsText);
+  drawHeightSpeedRow(4, ellipText, speedText);
+  drawDistanceBearingRow(5, distText, brgText); // bottom line: distance & bearing FROM the reference point TO the current GPS position
+
+  // Single fast blit of the complete, fully-composed table to the real
+  // screen - this is the step that actually eliminates flicker, since
+  // every fillRect+print above happened invisibly in the off-screen buffer.
+  tableSprite.pushSprite(0, TABLE_TOP_Y);
+}
+
+void fullRedraw() {
+  tft.fillScreen(TFT_BLACK);
+  drawHeader();
+  drawTable();
+}
+
+// ================= Setup / loop =================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("ESP32-32E NMEA GPS monitor starting...");
+
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH); // backlight on
+
+  tft.init();
+  tft.setRotation(3);
+  screenW = tft.width();
+  screenH = tft.height();
+  computeRowLayout(); // must run before sprite creation, which depends on ROW_H
+  Serial.printf("Screen: %dx%d, ROW_H=%d (table needs %dpx, have %dpx)\n",
+                screenW, screenH, ROW_H, TABLE_TOP_Y + NUM_ROWS*ROW_H, screenH);
+  tft.fillScreen(TFT_BLACK);
+
+  // 8-bit color depth (not 16) - halves the RAM requirement. The table
+  // only ever uses a handful of standard named colors (cyan/white/green/
+  // black/orange/purple text on black), so the reduced palette costs
+  // nothing visually here.
+  tableSprite.setColorDepth(8);
+  if (!tableSprite.createSprite(screenW, NUM_ROWS * ROW_H)) {
+    // If this fails (unlikely - the sprite only needs roughly
+    // screenW * NUM_ROWS*ROW_H * 2 bytes, well within this chip's RAM),
+    // the data table will show blank rather than crash. If you ever see
+    // this message, reducing tableSprite.setColorDepth() to 8 would roughly
+    // halve the RAM requirement.
+    Serial.println("Sprite creation FAILED - data table will not display. Check free heap.");
+  } else {
+    tableSprite.fillSprite(TFT_BLACK);
+    drawGridLines(); // drawn once here - persists across every later drawTable() call
+  }
+
+  headerSprite.setColorDepth(8);
+  if (!headerSprite.createSprite(screenW, TABLE_TOP_Y)) {
+    Serial.println("Header sprite creation FAILED - header will not display.");
+  }
+
+  // RX-only: IO35 is input-only, and TX is intentionally disabled (-1) -
+  // this sketch only monitors incoming NMEA, never sends anything to the GPS.
+  GpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, -1);
+
+  if (SD.begin(SD_CS)) {
+    sdAvailable = true;
+    findNextLogSessionNum();
+    Serial.printf("SD card ready. Fallback log session (used only if no GPS date/time yet): gps_log_%03d.txt\n", logSessionNum);
+  } else {
+    sdAvailable = false;
+    Serial.println("SD card init FAILED - logging disabled, display will still work.");
+  }
+
+  fullRedraw();
+}
+
+unsigned long lastHeaderUpdate = 0;
+
+void loop() {
+  feedGpsData();
+  checkLogTimeout();
+
+  bool gotUpdate = gpsDataUpdated;
+  gpsDataUpdated = false;
+
+  if (millis() - lastHeaderUpdate > 250) {
+    drawHeader();
+    lastHeaderUpdate = millis();
+  }
+
+  if (gotUpdate) {
+    drawTable();
+  }
+
+  delay(5);
+}

@@ -180,16 +180,24 @@
 /* ============================================================
  * PART 7: Display driver interfaces
  *
- * We use TFT_eSPI with our own flush_cb() in main.cpp,
- * so ALL built-in display drivers must be OFF here.
- * Otherwise they'd conflict with TFT_eSPI on the SPI bus,
- * or even break compilation.
+ * We use TFT_eSPI. LVGL provides a helper (lv_tft_espi_create)
+ * that wires TFT_eSPI and LVGL together, but it must be enabled
+ * below — otherwise you get:
+ *     'lv_tft_espi_create' was not declared in this scope
  * ============================================================ */
 
 /*
+ * TFT_eSPI driver — REQUIRED for the CYD.
+ * This enables lv_tft_espi_create() so LVGL can talk to TFT_eSPI.
+ * Without it, the function isn't compiled and the linker can't
+ * find it. Set to 1 for our build.
+ */
+#define LV_USE_TFT_ESPI         1
+
+/*
  * LovyanGFX driver.
- * MUST be 0! This was the source of the earlier
- * "my_display.hpp: No such file" error.
+ * MUST be 0! We're using TFT_eSPI, not LovyanGFX.
+ * Enabling both would cause SPI bus conflicts.
  */
 #define LV_USE_LOVYAN_GFX       0
 
