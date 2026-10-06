@@ -62,6 +62,24 @@ static void update_timer_cb(lv_timer_t *t) {
     lv_label_set_text_fmt(label_update_timer, "%d", counter++);
 }
 
+lv_obj_t *label_second_timer = nullptr;
+lv_timer_t *second_timer = nullptr;
+
+static void update_timer_cb_second(lv_timer_t *t)
+{
+    static int counter = 0;
+    lv_label_set_text_fmt(label_second_timer, "R%d", counter++); // Attaching to Display
+}
+
+lv_obj_t *label_third_timer = nullptr;
+lv_timer_t *third_timer = nullptr;
+
+static void update_timer_cb_third(lv_timer_t *t)
+{
+    static int counter = 0;
+    lv_label_set_text_fmt(label_third_timer, "Counter: %d", counter++);
+}
+
 // ============================================================
 // setup() — runs once at boot
 // ============================================================
@@ -132,6 +150,18 @@ void setup() {
     // Fires every 1000 ms. Because lv_tick_set_cb(millis) is set above,
     // LVGL now has a working clock and this timer will actually expire.
     update_timer = lv_timer_create(update_timer_cb, 1000, NULL);
+
+    // ---- Second Periodic Timer ----
+    label_second_timer = lv_label_create(lv_screen_active());
+    lv_label_set_text(label_second_timer, "0");
+    lv_obj_align(label_second_timer, LV_ALIGN_TOP_LEFT, 10, 30);
+    second_timer = lv_timer_create(update_timer_cb_second, 500, NULL);
+
+    // ---- Third Periodic Timer ---
+    label_third_timer = lv_label_create(lv_screen_active());
+    lv_label_set_text(label_third_timer, "0");
+    lv_obj_align(label_third_timer, LV_ALIGN_TOP_LEFT, 10, 50);
+    third_timer = lv_timer_create(update_timer_cb_third, 250, NULL);
 
     // ========================================================
     // ==   YOUR UI ENDS HERE                                ==
