@@ -18,6 +18,21 @@ TFT_eSPI tft;
 static lv_color_t buf[320 * 10];
 
 // ============================================================
+// Subject / Observable
+// ============================================================
+
+lv_subject_t global_counter_subject;
+
+lv_subject_t global_sum_counter_subject;
+
+// Called when a subject Value changes
+static void counter_observerver_cb(lv_observer_t *observer, lv_subject_t *subject)
+{
+    int32_t value = lv_subject_get_int(subject);
+
+}
+
+// ============================================================
 // Display flush callback — the LVGL ↔ TFT bridge
 // ============================================================
 // LVGL calls this whenever it has finished rendering a rectangle.
@@ -59,6 +74,7 @@ static void update_timer_cb(lv_timer_t *t) {
     // lv_label_set_text_fmt() formats directly into LVGL's own
     // buffer — safer than building a std::string temporary and
     // passing a .c_str() pointer that may dangle.
+    lv_subject_set_int(&global_sum_counter_subject, counter++);
     lv_label_set_text_fmt(label_update_timer, "%d", counter++);
 }
 
@@ -68,6 +84,8 @@ lv_timer_t *second_timer = nullptr;
 static void update_timer_cb_second(lv_timer_t *t)
 {
     static int counter = 0;
+    lv_subject_set_int(&global_counter_subject, counter++);
+    lv_subject_set_int(&global_sum_counter_subject, counter++);
     lv_label_set_text_fmt(label_second_timer, "R%d", counter++); // Attaching to Display
 }
 
@@ -77,8 +95,13 @@ lv_timer_t *third_timer = nullptr;
 static void update_timer_cb_third(lv_timer_t *t)
 {
     static int counter = 0;
+    lv_subject_set_int(&global_sum_counter_subject, counter++);
     lv_label_set_text_fmt(label_third_timer, "Counter: %d", counter++);
 }
+
+lv_obj_t *label_fourth_timer = nullptr;
+lv_obj_t *label_global_sum_conter = nullptr;
+
 
 // ============================================================
 // setup() — runs once at boot
@@ -99,6 +122,14 @@ void setup() {
     // 2. LVGL core + display registration
     // --------------------------------------------------------
     lv_init();                   // boot LVGL's internal state machine
+
+
+    // ============================================================
+    // Initialize Subjects
+    // ============================================================
+
+    lv_subject_init_int(&global_counter_subject, 0);
+    lv_subject_init_int(&global_sum_counter_subject, 0);
 
     // *** CRITICAL ***
     // Tell LVGL to use Arduino's millis() as its time base.
@@ -162,6 +193,17 @@ void setup() {
     lv_label_set_text(label_third_timer, "0");
     lv_obj_align(label_third_timer, LV_ALIGN_TOP_LEFT, 10, 50);
     third_timer = lv_timer_create(update_timer_cb_third, 250, NULL);
+
+    // ---- Fourth Periodic Timer ----
+    label_fourth_timer = lv_label_create(lv_screen_active());
+    lv_obj_align(label_fourth_timer, LV_ALIGN_BOTTOM_MID, 0, -15);
+    lv_label_bind_text(label_fourth_timer, &global_counter_subject, "Global: %d");
+
+    // ---- Fifth Counter - Sum ----
+    label_global_sum_conter = lv_label_create(lv_screen_active());
+    lv_obj_align(label_global_sum_conter, LV_ALIGN_BOTTOM_MID, 0, -30);
+    lv_label_bind_text(label_global_sum_conter, &global_sum_counter_subject, "Sum: %d");
+
 
     // ========================================================
     // ==   YOUR UI ENDS HERE                                ==
