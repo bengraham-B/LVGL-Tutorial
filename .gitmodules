@@ -1,0 +1,3 @@
+[submodule "lib/AEG_ESP32_LIB"]
+	path = lib/AEG_ESP32_LIB
+	url = https://github.com/bengraham-B/AEG_ESP32_LIB.git

@@ -77,4 +77,6 @@ wifi_config.h
 # GitModules
 # ---------------------------------------------------------------
 
-lib/
+/lib/AEG_ESP32_LIB/
+/lib/other-lib/
+/lib/another-lib/

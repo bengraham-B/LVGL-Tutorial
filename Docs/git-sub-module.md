@@ -1,8 +1,15 @@
 # Git Sub-Module
 
 ## Add Submodule to the project
+
+### Basic Add Sub-Module COmmand
 ```shell
 git submodule add <your-library-repo-url> lib/<library-name>
+```
+
+### AEG_ESP32_LIB
+```shell
+git submodule add https://github.com/bengraham-B/AEG_ESP32_LIB.git lib/AEG_ESP32_LIB
 ```
 
 <hr/>
